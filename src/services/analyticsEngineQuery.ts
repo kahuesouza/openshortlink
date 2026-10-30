@@ -1353,6 +1353,86 @@ export async function getDeviceAnalyticsFromEngine(
 }
 
 /**
+ * Clicks by hour of day (0-23) and weekday (1=Monday ... 7=Sunday) from Workers Analytics Engine.
+ * Counts clicks only (no IPs / no personal data). `tzOffsetMinutes` shifts UTC to the viewer's local
+ * time (e.g. -180 for Brasilia) so "peak hour" matches the audience's clock.
+ */
+export async function getTimeOfDayAnalyticsFromEngine(
+  env: Env,
+  filters: AnalyticsEngineFilters,
+  startDate: string,
+  endDate: string,
+  tzOffsetMinutes: number = 0
+): Promise<Array<{ hour: number; weekday: number; clicks: number }>> {
+  const config = getAnalyticsEngineConfig(env);
+  if (!config) {
+    return [];
+  }
+
+  const startTimestamp = Math.floor(new Date(startDate).getTime() / 1000);
+  const endTimestamp = Math.floor(new Date(endDate).getTime() / 1000) + 86400;
+  // Clamp to real-world offsets and force an integer: the value is interpolated into SQL.
+  const offsetSeconds = Math.round(Math.max(-14 * 60, Math.min(14 * 60, Number(tzOffsetMinutes) || 0))) * 60;
+
+  const whereClause = buildFilterWhereClause(filters, startTimestamp, endTimestamp);
+
+  // SECURITY: CF Analytics Engine requires raw SQL. offsetSeconds is a clamped integer; other inputs
+  // are validated by buildFilterWhereClause().
+  const sqlQuery = `
+    SELECT
+      toHour(toDateTime(double1 + ${offsetSeconds})) as hour,
+      toDayOfWeek(toDateTime(double1 + ${offsetSeconds})) as weekday,
+      SUM(_sample_interval) as clicks
+    FROM ${quoteIdentifier(config.datasetName)}
+    WHERE ${whereClause}
+    GROUP BY hour, weekday
+    ORDER BY weekday, hour
+    LIMIT 200
+  `;
+
+  try {
+    const result = await queryAnalyticsEngineSQL(config, sqlQuery);
+    if (!result.data || result.data.length === 0) {
+      return [];
+    }
+    return result.data.map((row: any) => ({
+      hour: Number(row.hour) || 0,
+      weekday: Number(row.weekday) || 1,
+      clicks: Number(row.clicks) || 0,
+    }));
+  } catch (error) {
+    console.error('[ANALYTICS ENGINE] Error querying time-of-day analytics:', error);
+    return [];
+  }
+}
+
+/**
+ * Batched version of getTimeOfDayAnalyticsFromEngine (Analytics Engine filters at most 100 link IDs per query)
+ */
+export async function getTimeOfDayAnalyticsFromEngineBatched(
+  env: Env,
+  linkIds: string[],
+  startDate: string,
+  endDate: string,
+  tzOffsetMinutes: number = 0
+): Promise<Array<{ hour: number; weekday: number; clicks: number }>> {
+  const batches = batchLinkIds(linkIds);
+  const results = await Promise.all(
+    batches.map(batch => getTimeOfDayAnalyticsFromEngine(env, { linkIds: batch }, startDate, endDate, tzOffsetMinutes))
+  );
+  const merged = new Map<string, { hour: number; weekday: number; clicks: number }>();
+  for (const batch of results) {
+    for (const p of batch) {
+      const key = `${p.weekday}:${p.hour}`;
+      const existing = merged.get(key);
+      if (existing) existing.clicks += p.clicks;
+      else merged.set(key, { ...p });
+    }
+  }
+  return Array.from(merged.values()).sort((a, b) => a.weekday - b.weekday || a.hour - b.hour);
+}
+
+/**
  * Get UTM analytics from Workers Analytics Engine
  */
 export async function getUtmAnalyticsFromEngine(

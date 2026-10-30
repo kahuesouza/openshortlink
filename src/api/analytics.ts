@@ -58,6 +58,8 @@ import {
   getGeoAnalyticsFromEngine,
   getReferrerAnalyticsFromEngine,
   getDeviceAnalyticsFromEngine,
+  getTimeOfDayAnalyticsFromEngine,
+  getTimeOfDayAnalyticsFromEngineBatched,
   getUtmAnalyticsFromEngine,
   getCustomParamAnalyticsFromEngine,
   getAggregatedSummaryFromEngine,
@@ -3019,6 +3021,101 @@ analyticsRouter.get('/breakdown/os', authMiddleware, requirePermission('view_ana
     });
   } catch (error) {
     console.error('[ANALYTICS ERROR] OS breakdown:', error);
+    if (error instanceof HTTPException) throw error;
+    throw new HTTPException(500, { message: error instanceof Error ? error.message : 'An internal error occurred' });
+  }
+});
+
+// Time-of-day breakdown endpoint: clicks by hour (0-23) and weekday (1=Mon ... 7=Sun).
+// Analytics Engine only (the D1 daily aggregates have no hour), so it covers the last ~89 days.
+// Optional `tz_offset` (minutes from UTC, e.g. -180 for Brasilia) shows the audience's local time.
+analyticsRouter.get('/breakdown/time-of-day', authMiddleware, requirePermission('view_analytics'), async (c) => {
+  try {
+    const queryParams = analyticsQuerySchema.parse({
+      link_id: c.req.query('link_id'),
+      link_ids: c.req.query('link_ids'),
+      domain_id: c.req.query('domain_id'),
+      domain_ids: c.req.query('domain_ids'),
+      tag_ids: c.req.query('tag_ids'),
+      category_ids: c.req.query('category_ids'),
+      start_date: c.req.query('start_date'),
+      end_date: c.req.query('end_date'),
+      data_source: 'auto',
+    });
+    const tzOffset = parseInt(c.req.query('tz_offset') || '0', 10);
+    if (Number.isNaN(tzOffset) || Math.abs(tzOffset) > 14 * 60) {
+      throw new HTTPException(400, { message: 'tz_offset must be minutes from UTC between -840 and 840.' });
+    }
+
+    const user = (c as any).get('user') as User;
+    const filters = await getAnalyticsFilters(c.env, user, queryParams);
+
+    const endDate = queryParams.end_date || new Date().toISOString().slice(0, 10);
+    const startDate = queryParams.start_date || (() => {
+      const date = new Date();
+      date.setDate(date.getDate() - 30);
+      return date.toISOString().slice(0, 10);
+    })();
+
+    const dataSourceDecision = await determineDataSources(c.env, startDate, endDate, 'auto');
+    const linkIds = await getFilteredLinkIds(c.env, filters);
+    const engineFilterResult = buildAnalyticsEngineFilters(linkIds, filters);
+    const analyticsEngineFilters = engineFilterResult.filters;
+    const warnings: string[] = [];
+    let points: Array<{ hour: number; weekday: number; clicks: number }> = [];
+
+    if (dataSourceDecision.splitRange.old !== null) {
+      warnings.push('Hour-of-day data is only available for the last ~89 days; older days were left out.');
+    }
+
+    const range = dataSourceDecision.splitRange.recent;
+    if (range && dataSourceDecision.useAnalyticsEngine) {
+      const credentialError = checkAnalyticsEngineCredentials(c.env);
+      if (credentialError) {
+        warnings.push(credentialError);
+      } else {
+        try {
+          points = engineFilterResult.needsBatching && engineFilterResult.fullLinkIds.length > 0
+            ? await getTimeOfDayAnalyticsFromEngineBatched(c.env, engineFilterResult.fullLinkIds, range.start, range.end, tzOffset)
+            : await getTimeOfDayAnalyticsFromEngine(c.env, analyticsEngineFilters, range.start, range.end, tzOffset);
+        } catch (error) {
+          console.error('[ANALYTICS] Error querying Analytics Engine for time of day:', error);
+          warnings.push(`Failed to query Analytics Engine: ${error instanceof Error ? error.message : 'unknown error'}.`);
+        }
+      }
+    } else if (range) {
+      warnings.push('Recent data (< 89 days) not available - API credentials required');
+    }
+
+    const byHour = Array.from({ length: 24 }, (_, hour) => ({ hour, clicks: 0 }));
+    const byWeekday = Array.from({ length: 7 }, (_, i) => ({ weekday: i + 1, clicks: 0 }));
+    for (const p of points) {
+      if (p.hour >= 0 && p.hour <= 23) byHour[p.hour].clicks += p.clicks;
+      if (p.weekday >= 1 && p.weekday <= 7) byWeekday[p.weekday - 1].clicks += p.clicks;
+    }
+    const total = byHour.reduce((s, x) => s + x.clicks, 0);
+    const peakHour = total > 0 ? byHour.reduce((a, b) => (b.clicks > a.clicks ? b : a)).hour : null;
+    const peakWeekday = total > 0 ? byWeekday.reduce((a, b) => (b.clicks > a.clicks ? b : a)).weekday : null;
+
+    return c.json({
+      success: true,
+      data: {
+        period: { start_date: startDate, end_date: endDate },
+        tz_offset: tzOffset,
+        by_hour: byHour,
+        by_weekday: byWeekday,
+        heatmap: points,
+        peak_hour: peakHour,
+        peak_weekday: peakWeekday,
+        total_clicks: total,
+      },
+      meta: {
+        data_source: 'analytics_engine',
+        warnings: warnings.length > 0 ? warnings : undefined,
+      },
+    });
+  } catch (error) {
+    console.error('[ANALYTICS ERROR] Time-of-day breakdown:', error);
     if (error instanceof HTTPException) throw error;
     throw new HTTPException(500, { message: error instanceof Error ? error.message : 'An internal error occurred' });
   }

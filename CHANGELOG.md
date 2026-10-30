@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Clicks by hour of day and weekday**: new `GET /analytics/breakdown/time-of-day` endpoint (same filters as the other breakdowns: `link_id(s)`, `domain_id(s)`, `tag_ids`, `category_ids`, `start_date`, `end_date`). Returns `by_hour` (0-23), `by_weekday` (1=Mon ... 7=Sun), a `heatmap` of weekday x hour, and the peak hour/weekday. Optional `tz_offset` (minutes from UTC, e.g. `-180`) shows the audience's local time. Counts clicks only, no IPs or other personal data. Analytics Engine only (the D1 daily aggregates have no hour), so it covers the last ~89 days.
+
 ## [0.11.0] - 2026-10-07
 
 ### ⚠️ Behaviour changes to check before upgrading
