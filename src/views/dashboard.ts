@@ -60,6 +60,7 @@ export function dashboardHtml(csrfToken: string, nonce: string): string {
             <a href="#analytics-custom-params" class="nav-submenu-link" data-page="analytics-custom-params">Custom Parameters</a>
             <a href="#analytics-os" class="nav-submenu-link" data-page="analytics-os">Operating Systems</a>
             <a href="#analytics-browsers" class="nav-submenu-link" data-page="analytics-browsers">Browsers</a>
+            <a href="#analytics-time" class="nav-submenu-link" data-page="analytics-time">Time of Day</a>
           </div>
           <a href="#status-monitor" class="nav-link" data-page="status-monitor">Link Monitor</a>
           <div class="nav-link" id="integrations-nav-link" data-page="integrations">
@@ -277,6 +278,11 @@ export function dashboardHtml(csrfToken: string, nonce: string): string {
           <h1>Browsers Analytics</h1>
           <div id="analytics-browsers-filters" class="analytics-breakdown-filters"></div>
           <div id="analytics-browsers-content"><p>Loading browsers analytics...</p></div>
+        </div>
+        <div id="analytics-time-page" class="page">
+          <h1>Time of Day Analytics</h1>
+          <div id="analytics-time-filters" class="analytics-breakdown-filters"></div>
+          <div id="analytics-time-content"><p>Loading time of day analytics...</p></div>
         </div>
         <div id="domains-page" class="page">
           <div class="page-header">
@@ -1688,6 +1694,7 @@ export function dashboardHtml(csrfToken: string, nonce: string): string {
             'analytics-custom-params',
             'analytics-os',
             'analytics-browsers',
+            'analytics-time',
             'link-analytics',
             'links-by-destination'
           ];
@@ -1722,6 +1729,7 @@ export function dashboardHtml(csrfToken: string, nonce: string): string {
         else if (pageName === 'analytics-custom-params') loadAnalyticsCustomParams();
         else if (pageName === 'analytics-os') loadAnalyticsOS();
         else if (pageName === 'analytics-browsers') loadAnalyticsBrowsers();
+        else if (pageName === 'analytics-time') loadAnalyticsTimeOfDay();
         else if (pageName === 'tags') {
           loadTags();
           loadTagsManagement();
@@ -6689,6 +6697,132 @@ export function dashboardHtml(csrfToken: string, nonce: string): string {
       } catch (error) {
         content.innerHTML = '<p style="color: #dc3545;">Error loading OS analytics: ' + escapeHtml(error.message) + '</p>';
         console.error('OS analytics error:', error);
+      }
+    }
+
+    // Time of day breakdown (hour x weekday), shown in the viewer's own timezone
+    async function loadAnalyticsTimeOfDay() {
+      const containerId = 'analytics-time-filters';
+      const contentId = 'analytics-time-content';
+      const weekdayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+      const hourLabel = h => String(h).padStart(2, '0') + ':00';
+
+      const filtersContainer = document.getElementById(containerId);
+      if (filtersContainer && !filtersContainer.dataset.initialized) {
+        createAnalyticsFilters(containerId);
+        filtersContainer.dataset.initialized = 'true';
+        document.getElementById(containerId + '-load-btn').addEventListener('click', loadAnalyticsTimeOfDay);
+
+        const exportBtn = document.getElementById(containerId + '-export-btn');
+        if (exportBtn) {
+          const newExportBtn = exportBtn.cloneNode(true);
+          exportBtn.parentNode.replaceChild(newExportBtn, exportBtn);
+          newExportBtn.addEventListener('click', () => {
+            const content = document.getElementById(contentId);
+            if (!content || !content.dataset.lastData) {
+              showToast('No data to export', 'warning');
+              return;
+            }
+            try {
+              const data = JSON.parse(content.dataset.lastData);
+              if (!data || !data.heatmap || data.heatmap.length === 0) {
+                showToast('No data to export', 'warning');
+                return;
+              }
+              const headers = ['Weekday', 'Hour', 'Clicks'];
+              const rows = data.heatmap.map(item => [weekdayNames[item.weekday - 1], hourLabel(item.hour), item.clicks]);
+              downloadCsv('analytics_time_of_day.csv', headers, rows);
+            } catch (e) {
+              console.error('Export error:', e);
+              showToast('Failed to export data', 'error');
+            }
+          });
+        }
+      }
+
+      const content = document.getElementById(contentId);
+      if (!content) return;
+
+      content.innerHTML = '<div class="loading-spinner"></div> Loading time of day analytics...';
+
+      try {
+        const filters = getFilterValues(containerId);
+        const params = buildQueryParams(filters);
+        const tzOffset = -new Date().getTimezoneOffset();
+        const data = await apiRequest('/analytics/breakdown/time-of-day?' + params + (params ? '&' : '') + 'tz_offset=' + tzOffset);
+
+        if (!data.success || !data.data) {
+          throw new Error(data.message || 'Failed to load time of day analytics');
+        }
+
+        content.dataset.lastData = JSON.stringify(data.data);
+
+        const d = data.data;
+        const totalClicks = d.total_clicks || 0;
+        const warnings = (data.meta && data.meta.warnings) || [];
+        const warningHtml = warnings.map(w => '<p style="color: #b8860b;">' + escapeHtml(w) + '</p>').join('');
+        const tzLabel = 'UTC' + (tzOffset >= 0 ? '+' : '-') + String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, '0') + ':' + String(Math.abs(tzOffset) % 60).padStart(2, '0');
+
+        let html = warningHtml + '<div class="summary-cards">' +
+          '<div class="summary-card"><h3>Total Clicks</h3><div class="value">' + totalClicks.toLocaleString() + '</div></div>' +
+          '<div class="summary-card"><h3>Peak Hour</h3><div class="value">' + (d.peak_hour === null ? '-' : hourLabel(d.peak_hour)) + '</div></div>' +
+          '<div class="summary-card"><h3>Peak Weekday</h3><div class="value">' + (d.peak_weekday === null ? '-' : weekdayNames[d.peak_weekday - 1]) + '</div></div>' +
+          '</div>';
+
+        if (totalClicks === 0) {
+          content.innerHTML = html + '<p style="text-align: center; color: var(--secondary-color); padding: 2rem;">No click data available for the selected filters.</p>';
+          return;
+        }
+
+        // Heatmap: weekday rows x hour columns, shaded by share of the busiest cell
+        const grid = {};
+        let maxCell = 0;
+        (d.heatmap || []).forEach(p => {
+          grid[p.weekday + ':' + p.hour] = p.clicks;
+          if (p.clicks > maxCell) maxCell = p.clicks;
+        });
+        let heat = '<table class="data-table" style="font-size: 0.75rem; text-align: center;"><thead><tr><th></th>';
+        for (let h = 0; h < 24; h++) heat += '<th>' + String(h).padStart(2, '0') + '</th>';
+        heat += '</tr></thead><tbody>';
+        for (let w = 1; w <= 7; w++) {
+          heat += '<tr><td style="text-align: left;">' + weekdayNames[w - 1].slice(0, 3) + '</td>';
+          for (let h = 0; h < 24; h++) {
+            const c = grid[w + ':' + h] || 0;
+            const alpha = maxCell > 0 ? (c / maxCell) : 0;
+            heat += '<td title="' + weekdayNames[w - 1] + ' ' + hourLabel(h) + ': ' + c + ' clicks" style="background: rgba(0, 123, 255, ' + alpha.toFixed(2) + ');">' + (c > 0 ? c : '') + '</td>';
+          }
+          heat += '</tr>';
+        }
+        heat += '</tbody></table>';
+
+        html += '<div class="chart-container"><h3>Clicks by Hour (' + tzLabel + ')</h3><div class="chart-wrapper"><canvas id="time-hour-chart"></canvas></div></div>' +
+          '<div class="chart-container"><h3>Clicks by Weekday</h3><div class="chart-wrapper"><canvas id="time-weekday-chart"></canvas></div></div>' +
+          '<div class="data-table-container"><h3>Weekday x Hour</h3><div style="overflow-x: auto;">' + heat + '</div></div>';
+
+        content.innerHTML = html;
+
+        if (typeof Chart !== 'undefined') {
+          const barOptions = { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } };
+          const hourCtx = document.getElementById('time-hour-chart');
+          if (hourCtx) {
+            new Chart(hourCtx, {
+              type: 'bar',
+              data: { labels: d.by_hour.map(x => hourLabel(x.hour)), datasets: [{ label: 'Clicks', data: d.by_hour.map(x => x.clicks), backgroundColor: 'rgba(0, 123, 255, 0.8)' }] },
+              options: barOptions,
+            });
+          }
+          const dayCtx = document.getElementById('time-weekday-chart');
+          if (dayCtx) {
+            new Chart(dayCtx, {
+              type: 'bar',
+              data: { labels: d.by_weekday.map(x => weekdayNames[x.weekday - 1]), datasets: [{ label: 'Clicks', data: d.by_weekday.map(x => x.clicks), backgroundColor: 'rgba(40, 167, 69, 0.8)' }] },
+              options: barOptions,
+            });
+          }
+        }
+      } catch (error) {
+        content.innerHTML = '<p style="color: #dc3545;">Error loading time of day analytics: ' + escapeHtml(error.message) + '</p>';
+        console.error('Time of day analytics error:', error);
       }
     }
 
